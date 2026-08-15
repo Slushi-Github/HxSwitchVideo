@@ -1,0 +1,17 @@
+{
+    "name": "hxswitchvideo",
+    "url": "https://github.com/Slushi-Github/HxSwitchVideo",
+    "license": "MIT",
+    "tags": [
+        "cpp",
+        "haxe",
+        "mpv",
+        "video",
+        "haxeflixel"
+    ],
+    "description": "A HaxeFlixel library for @:native video playback using MPV for the Nintendo Switch.",
+    "version": "1.0.0",
+    "releasenote": "",
+    "contributors": ["Slushi"],
+    "dependencies": {}
+}

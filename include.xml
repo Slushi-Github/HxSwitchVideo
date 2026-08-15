@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<extension xmlns="http://lime.openfl.org/project/1.0.4"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://lime.openfl.org/project/1.0.4 http://lime.openfl.org/xsd/project-1.0.4.xsd">
+
+    <log error="HxSwitchVideo only supports Switch target" unless="switch" />
+
+    <!-- Libs for MakeFile on Lime -->
+    <section if="switch">
+        <haxedef name="LIME_SWITCH_LIBS" value="mpv,ass,avfilter,avformat,avcodec,avutil,swresample,swscale,postproc,placebo,archive,dav1d,fribidi,png16,lzma,lz4,zstd,expat,GLESv2,jpeg,freetype,avcodec,z,bz2,nx"/>
+    </section>
+</extension>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+    <files id="haxe">
+        <compilerflag value="-I${DEVKITPRO}/portlibs/switch/include" if="nx || switch || HX_NX"/>
+        <file name="${haxelib:hxswitchvideo}/project/mpvBackend/switchvideo_mpv_native.cpp" />
+        <compilerflag value="-I${haxelib:hxswitchvideo}/project/mpvBackend" if="nx || switch || HX_NX" />
+    </files>
+
+    <files id="__main__">
+        <compilerflag value="-I${DEVKITPRO}/portlibs/switch/include" if="nx || switch || HX_NX"/>
+        <compilerflag value="-I${haxelib:hxswitchvideo}/project/mpvBackend" if="nx || switch || HX_NX" />
+    </files>
+</project>
