@@ -515,7 +515,7 @@ class SwitchVideo extends FlxSprite
 			return;
 		}
 
-		SwitchVideoLog.log('setupVideo: Video=${wx}${h}, Screen=${FlxG.width}x${FlxG.height}, OnFormatSetup=${onFormatSetup != null}');
+		SwitchVideoLog.log('setupVideo: Video=${x}${h}, Screen=${FlxG.width}x${FlxG.height}, OnFormatSetup=${onFormatSetup != null}');
 
 		_videoWidth = w;
 		_videoHeight = h;
