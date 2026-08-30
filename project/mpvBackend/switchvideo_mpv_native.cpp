@@ -434,49 +434,72 @@ extern void switchvideo_mpv_rgba_to_argb(const unsigned char *src, unsigned char
 	}
 }
 
+/*
+ * Audio: main thread OpenAL, background FFmpeg decode only
+ *
+ * The background thread ONLY decodes FFmpeg audio into a lock-free ring
+ * buffer, it NEVER touches OpenAL.
+ *
+ * The main thread (switchvideo_mpv_ao_update function) drains the ring buffer and
+ * feeds OpenAL, all OpenAL calls happen on the main thread, it's the
+ * only thread that has the game's context current.
+ *
+ * This avoids 3 Switch openal-soft bugs:
+ *   1. Creating a second context on the same device corrupts the device.
+ *   2. Calling alcMakeContextCurrent(NULL) from a non-main thread corrupts it.
+ *   3. Sharing a context between threads causes stuttering.
+ */
+
 #include <AL/al.h>
 #include <AL/alc.h>
 
-/*
-	FFmpeg audio decode to OpenAL buffer‑queue streaming
-*/
-#include <pthread.h>
-#include <stdio.h>
-#include <time.h>
 extern "C"
 {
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libswresample/swresample.h>
-#include <libavutil/channel_layout.h>
+	#include <libavformat/avformat.h>
+	#include <libavcodec/avcodec.h>
+	#include <libswresample/swresample.h>
+	#include <libavutil/channel_layout.h>
 }
 
-#define AO_BUFS 4
+// ring buffer: 48kHz stereo S16 = 192000 bytes/sec. 2MB ~10s streaming.
+#define RING_SIZE 2097152
+#define RING_MASK (RING_SIZE - 1)
 #define AO_SAMP 4096
 #define AO_IOBUF 32768
+#define AL_BUF_COUNT 8
+#define AL_BUF_SAMPLES 4096
 
 static pthread_t aoThread;
-static volatile int aoStop = 0;
-static int aoAlive = 0;
-static ALuint aoSrc = 0;
-static ALuint aoBufsInt[AO_BUFS];
-static ALuint aoPrimerSrc = 0;
-static ALuint aoPrimerBuf = 0;
-static ALCcontext *aoCtx = NULL;
-static ALCcontext *aoAudioCtx = NULL;
-static ALCdevice *aoDev = NULL;
-static volatile int aoGate = 0;
+static int aoThreadCreated = 0;
+static volatile int aoWantStop = 0;
 static volatile int aoReady = 0;
+static volatile int aoDone = 0;
+static volatile int aoGate = 0;
+
+// ring buffer (decoder writes, main thread reads)
+static uint8_t aoRing[RING_SIZE];
+static volatile int aoRingHead = 0;
+static volatile int aoRingTail = 0;
+static volatile int aoRingEof = 0;
+
+// position tracking
+static double aoPosCache = 0;
+static double aoPlayStartSec = 0;
+
+// AL state (main thread only, on game's context)
+static ALuint aoSrc = 0;
+static ALuint aoBufs[AL_BUF_COUNT];
+static int aoBufHasData[AL_BUF_COUNT];
 
 extern void switchvideo_mpv_audio_stop_func(void);
 extern void switchvideo_mpv_audio_start(const char *cpath);
 
-/**
- * Interrupt callback invoked by FFmpeg to gracefully handle thread termination.
- */
+/*
+	FFmpeg I/O callbacks
+*/
 static int switchvideo_mpv_ao_interrupt(void *unused)
 {
-	return aoStop;
+	return aoWantStop;
 }
 
 /*
@@ -506,56 +529,58 @@ static int64_t switchvideo_mpv_ao_seek(void *opaque, int64_t offset, int whence)
 	return ftell(f);
 }
 
-/*
-	Decode packets until we get one audio frame, convert to S16 stereo, fill buffer.
-	Returns 1 on success, 0 on EOF/error.
-*/
-static int switchvideo_mpv_ao_fill(AVFormatContext *fmt, AVCodecContext *dec, SwrContext *swr, AVFrame *frm, AVPacket *pkt, int idx, ALuint buf, int16_t *cvt)
+// lock-free SPSC ring buffer
+static int ring_write(const uint8_t *data, int len)
 {
-	for (;;)
+	int head = aoRingHead;
+	int tail = aoRingTail;
+	int free = (tail - head - 1) & RING_MASK;
+	if (len > free)
+		len = free;
+	if (len <= 0)
+		return 0;
+	int avail = RING_SIZE - head;
+	if (len > avail)
 	{
-		if (avcodec_receive_frame(dec, frm) == 0)
-		{
-			int n = swr_convert(swr, (uint8_t **)&cvt, AO_SAMP, (const uint8_t **)frm->extended_data, frm->nb_samples);
-			if (n > 0)
-			{
-				ALsizei sz = n * 2 * (int)sizeof(int16_t);
-				alBufferData(buf, AL_FORMAT_STEREO16, cvt, sz, 48000);
-				{
-					ALenum e = alGetError();
-					if (e != AL_NO_ERROR)
-						vidlog("[audio] alBufferData buf=%u n=%d bytes=%d err=0x%x\n", (unsigned)buf, n, (int)sz, e);
-				}
-				return 1;
-			}
-			continue;
-		}
-		if (av_read_frame(fmt, pkt) < 0)
-		{
-			avcodec_send_packet(dec, NULL);
-			continue;
-		}
-		if (pkt->stream_index != idx)
-		{
-			av_packet_unref(pkt);
-			continue;
-		}
-		avcodec_send_packet(dec, pkt);
-		av_packet_unref(pkt);
+		memcpy(aoRing + head, data, avail);
+		memcpy(aoRing, data + avail, len - avail);
 	}
+	else
+	{
+		memcpy(aoRing + head, data, len);
+	}
+	aoRingHead = (head + len) & RING_MASK;
+	return len;
 }
 
-static double aoPosCache = 0;
-static void switchvideo_mpv_ao_start_primer(void);
-static void aoStop_primer(void);
+static int ring_read(uint8_t *data, int len)
+{
+	int head = aoRingHead;
+	int tail = aoRingTail;
+	int avail = (head - tail) & RING_MASK;
+	if (len > avail)
+		len = avail;
+	if (len <= 0)
+		return 0;
+	int to_end = RING_SIZE - tail;
+	if (len > to_end)
+	{
+		memcpy(data, aoRing + tail, to_end);
+		memcpy(data + to_end, aoRing, len - to_end);
+	}
+	else
+	{
+		memcpy(data, aoRing + tail, len);
+	}
+	aoRingTail = (tail + len) & RING_MASK;
+	return len;
+}
 
-/**
- * Worker thread execution routine responsible for decoding audio via FFmpeg,
- * resampling to 48kHz S16 stereo, and streaming buffers to OpenAL.
- */
+// bg thread: FFmpeg decode ONLY, no OpenAL
 static void *switchvideo_mpv_ao_func(void *arg)
 {
 	char *path = (char *)arg;
+	vidlog("[audio] decode thread started, path=%s\n", path);
 
 	AVFormatContext *fmt = NULL;
 	AVCodecContext *dec = NULL;
@@ -564,64 +589,34 @@ static void *switchvideo_mpv_ao_func(void *arg)
 	AVPacket *pkt = av_packet_alloc();
 	int16_t *cvt = NULL;
 	int idx = -1;
+	int64_t totalWritten = 0;
 	const AVCodec *codec = NULL;
 	AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
-	ALenum err;
-	ALint state = 0;
 	FILE *file = NULL;
 	AVIOContext *avio = NULL;
-
-	vidlog("[audio] thread started, path=%s dev=%p\n", path, aoDev);
-
-	/*
-		Reuse or create a persistent audio-only context on the same device.
-		We NEVER destroy this context because alcDestroyContext on Switch's
-		openal-soft appears to reset or corrupt the device, killing the
-		game's audio even though the game's own context is untouched.
-	*/
-	if (!aoAudioCtx && aoDev)
-	{
-		aoAudioCtx = alcCreateContext(aoDev, NULL);
-		if (aoAudioCtx)
-			vidlog("[audio] created persistent audio context=%p\n", aoAudioCtx);
-		else
-			vidlog("[audio] alcCreateContext FAILED: %d\n", alcGetError(aoDev));
-	}
-
-	if (aoAudioCtx)
-	{
-		if (!alcMakeContextCurrent(aoAudioCtx))
-			vidlog("[audio] alcMakeContextCurrent FAILED: 0x%x\n", alcGetError(NULL));
-		else
-		{
-			vidlog("[audio] audio context current, starting primer\n");
-			switchvideo_mpv_ao_start_primer();
-		}
-	}
-	else
-		vidlog("[audio] WARNING: no audio context available\n");
 
 	file = fopen(path, "rb");
 	if (!file)
 	{
-		vidlog("[audio] fopen FAILED: %s\n", path);
-		goto end;
+		vidlog("[audio] fopen FAILED\n");
+		goto done;
 	}
-	vidlog("[audio] fopen OK\n");
 
-	avio = avio_alloc_context((unsigned char *)av_malloc(AO_IOBUF),
-							  AO_IOBUF, 0, file, switchvideo_mpv_ao_read, NULL, switchvideo_mpv_ao_seek);
+	avio = avio_alloc_context((unsigned char *)av_malloc(AO_IOBUF), AO_IOBUF, 0, file, switchvideo_mpv_ao_read, NULL, switchvideo_mpv_ao_seek);
 	if (!avio)
 	{
-		vidlog("[audio] avio_alloc_context FAILED\n");
-		goto end;
+		fclose(file);
+		file = NULL;
+		goto done;
 	}
 
 	fmt = avformat_alloc_context();
 	if (!fmt)
 	{
-		vidlog("[audio] avformat_alloc_context FAILED\n");
-		goto end;
+		avio_context_free(&avio);
+		fclose(file);
+		file = NULL;
+		goto done;
 	}
 	fmt->pb = avio;
 	fmt->interrupt_callback.callback = switchvideo_mpv_ao_interrupt;
@@ -629,7 +624,6 @@ static void *switchvideo_mpv_ao_func(void *arg)
 		int ret = avformat_open_input(&fmt, NULL, NULL, NULL);
 		if (ret < 0)
 		{
-			vidlog("[audio] avformat_open_input FAILED ret=%d (0x%x)\n", ret, (unsigned)ret);
 			if (fmt)
 			{
 				avformat_free_context(fmt);
@@ -638,265 +632,109 @@ static void *switchvideo_mpv_ao_func(void *arg)
 			avio_context_free(&avio);
 			fclose(file);
 			file = NULL;
-			goto end;
+			goto done;
 		}
 	}
-	avio = NULL; // fmt owns the AVIO now
-	vidlog("[audio] avformat_open_input OK\n");
-	if (avformat_find_stream_info(fmt, NULL) < 0)
-	{
-		vidlog("[audio] avformat_find_stream_info FAILED\n");
-		goto end;
-	}
-	vidlog("[audio] nb_streams=%u\n", fmt->nb_streams);
+	avio = NULL;
 
+	if (avformat_find_stream_info(fmt, NULL) < 0)
+		goto done;
 	for (unsigned i = 0; i < fmt->nb_streams; i++)
-	{
-		vidlog("[audio] stream[%u] type=%d\n", i, fmt->streams[i]->codecpar->codec_type);
 		if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
 		{
-			idx = i;
+			idx = (int)i;
 			break;
 		}
-	}
 	if (idx < 0)
-	{
-		vidlog("[audio] no audio stream found\n");
-		goto end;
-	}
-
-	/*
-		Discard everything except the audio stream so av_read_frame only
-		ever returns audio packets; reading big VP9 video packets was
-		slowing the decode loop below real-time.
-	*/
+		goto done;
 	for (unsigned i = 0; i < fmt->nb_streams; i++)
 		if ((int)i != idx)
 			fmt->streams[i]->discard = AVDISCARD_ALL;
 
 	codec = avcodec_find_decoder(fmt->streams[idx]->codecpar->codec_id);
 	if (!codec)
-	{
-		vidlog("[audio] avcodec_find_decoder FAILED\n");
-		goto end;
-	}
-	vidlog("[audio] decoder=%s\n", codec->name);
+		goto done;
 
 	dec = avcodec_alloc_context3(codec);
 	avcodec_parameters_to_context(dec, fmt->streams[idx]->codecpar);
 	if (avcodec_open2(dec, codec, NULL) < 0)
-	{
-		vidlog("[audio] avcodec_open2 FAILED\n");
-		goto end;
-	}
-	vidlog("[audio] avcodec_open2 OK: %dHz %dch\n", dec->sample_rate, dec->ch_layout.nb_channels);
+		goto done;
+	vidlog("[audio] decoder=%s %dHz %dch\n", codec->name, dec->sample_rate, dec->ch_layout.nb_channels);
 
-	swr = NULL;
 	if (swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_S16, 48000, &dec->ch_layout, dec->sample_fmt, dec->sample_rate, 0, NULL) < 0 || !swr || swr_init(swr) < 0)
-	{
-		vidlog("[audio] swr_init FAILED\n");
-		goto end;
-	}
-	vidlog("[audio] swr OK\n");
+		goto done;
 
 	cvt = (int16_t *)av_malloc(AO_SAMP * 2 * (int)sizeof(int16_t));
 
-	err = alGetError();
-	alGenSources(1, &aoSrc);
-	err = alGetError();
-	vidlog("[audio] alGenSources src=%u err=0x%x\n", aoSrc, err);
+	vidlog("[audio] decoder ready, signaling main thread\n");
+	aoReady = 1;
 
-	alGenBuffers(AO_BUFS, aoBufsInt);
-	err = alGetError();
-	vidlog("[audio] alGenBuffers err=0x%x\n", err);
-
-	if (aoSrc == 0)
+	while (!aoWantStop)
 	{
-		vidlog("[audio] FAILED to create AL source\n");
-		goto end;
-	}
-
-	// Decode + queue in a sliding window, play immediately
-	{
-		ALuint *bufs = NULL;
-		int nbufs = 0, cap = 0;
-		int chunk = AO_SAMP;
-		int queued = 0;
-		int written = 0;
-		int eof = 0;
-
-		// Queue first 25 buffers and start immediately
+		int got_frame = 0;
+		if (avcodec_receive_frame(dec, frm) == 0)
 		{
-			int want = 25;
-			for (int tried = 0; tried < 2000 && queued < want && !aoStop; tried++)
+			int n = swr_convert(swr, (uint8_t **)&cvt, AO_SAMP, (const uint8_t **)frm->extended_data, frm->nb_samples);
+			if (n > 0)
 			{
+				int bytes = n * 2 * (int)sizeof(int16_t);
+				int written = 0;
+				while (written < bytes && !aoWantStop)
+				{
+					int w = ring_write((uint8_t *)cvt + written, bytes - written);
+					if (w > 0)
+					{
+						written += w;
+						totalWritten += w;
+					}
+					else
+					{
+						struct timespec ts = {0, 5000000};
+						nanosleep(&ts, NULL);
+					}
+				}
+				got_frame = 1;
+			}
+		}
+		if (!got_frame)
+		{
+			if (av_read_frame(fmt, pkt) < 0)
+			{
+				avcodec_send_packet(dec, NULL);
 				if (avcodec_receive_frame(dec, frm) == 0)
 				{
-					int n = swr_convert(swr, (uint8_t **)&cvt, chunk, (const uint8_t **)frm->extended_data, frm->nb_samples);
+					int n = swr_convert(swr, (uint8_t **)&cvt, AO_SAMP, const uint8_t **)frm->extended_data, frm->nb_samples);
 					if (n > 0)
 					{
-						if (nbufs >= cap)
+						int bytes = n * 2 * (int)sizeof(int16_t);
+						int written = 0;
+						while (written < bytes && !aoWantStop)
 						{
-							int ncap = cap ? cap * 2 : 64;
-							ALuint *nb = (ALuint *)realloc(bufs, ncap * sizeof(ALuint));
-							if (!nb)
-								break;
-							bufs = nb;
-							cap = ncap;
+							int w = ring_write((uint8_t *)cvt + written, bytes - written);
+							if (w > 0)
+							{
+								written += w;
+								totalWritten += w;
+							}
+							else
+							{
+								struct timespec ts = {0, 5000000};
+								nanosleep(&ts, NULL);
+							}
 						}
-						alGenBuffers(1, &bufs[nbufs]);
-						alBufferData(bufs[nbufs], AL_FORMAT_STEREO16, cvt, (ALsizei)(n * 2 * sizeof(int16_t)), 48000);
-						alSourceQueueBuffers(aoSrc, 1, &bufs[nbufs]);
-						nbufs++;
-						queued++;
 					}
-					continue;
 				}
-				if (av_read_frame(fmt, pkt) < 0)
-				{
-					avcodec_send_packet(dec, NULL);
-					eof = 1;
-					break;
-				}
-				if (pkt->stream_index == idx)
-					avcodec_send_packet(dec, pkt);
-				av_packet_unref(pkt);
-			}
-		}
-
-		vidlog("[audio] initial queue: %d buffers (%.2fs)\n", queued, (double)queued * chunk / 48000.0);
-
-		// Signal the game: decode is ready, please unpause
-		aoReady = 1;
-
-		/*
-			Wait for the video to render its first frame before starting
-			playback, so audio and video begin from time 0 together.
-		*/
-		vidlog("[audio] waiting for video first frame\n");
-		while (!aoGate && !aoStop)
-		{
-			{
-				struct timespec ts = {0, 10000000};
-				nanosleep(&ts, NULL);
-			}
-		}
-		if (aoStop)
-		{
-			vidlog("[audio] stopped while waiting for gate\n");
-			goto end;
-		}
-		vidlog("[audio] gate open, starting playback\n");
-		aoStop_primer();
-
-		alSourcePlay(aoSrc);
-		vidlog("[audio] alSourcePlay err=0x%x\n", alGetError());
-		{
-			ALint st = 0, q = 0, pr = 0;
-			alGetSourcei(aoSrc, AL_SOURCE_STATE, &st);
-			alGetSourcei(aoSrc, AL_BUFFERS_QUEUED, &q);
-			alGetSourcei(aoSrc, AL_BUFFERS_PROCESSED, &pr);
-			vidlog("[audio] after play: state=%d queued=%d processed=%d err=0x%x\n", st, q, pr, alGetError());
-		}
-
-		/*
-			Keep decoding and appending; the mixer consumes from the front,
-			we add to the back. AL_BUFFERS_PROCESSED and AL_SAMPLE_OFFSET
-			are broken on Switch openal-soft, so we just decode until EOF
-			and wait for the source to finish.
-		*/
-		int spike = 0;
-		while (!aoStop)
-		{
-			state = 0;
-			alGetSourcei(aoSrc, AL_SOURCE_STATE, &state);
-			if (state != AL_PLAYING && state != AL_PAUSED)
-			{
-				ALint q = 0, pr = 0;
-				alGetSourcei(aoSrc, AL_SOURCE_STATE, &q);
-				alGetSourcei(aoSrc, AL_BUFFERS_PROCESSED, &pr);
-				vidlog("[audio] playback ended: state=%d queued=%d processed=%d err=0x%x\n", state, q, pr, alGetError());
+				aoRingEof = 1;
+				vidlog("[audio] decode EOF total=%lld bytes %.2fs\n", (long long)totalWritten, (double)totalWritten / 192000.0);
 				break;
 			}
-
-			// Try to decode more
-			if (!eof && avcodec_receive_frame(dec, frm) == 0)
-			{
-				int n = swr_convert(swr, (uint8_t **)&cvt, chunk,
-									(const uint8_t **)frm->extended_data, frm->nb_samples);
-				if (n > 0)
-				{
-					if (nbufs >= cap)
-					{
-						int ncap = cap ? cap * 2 : 64;
-						ALuint *nb = (ALuint *)realloc(bufs, ncap * sizeof(ALuint));
-						if (!nb)
-							break;
-						bufs = nb;
-						cap = ncap;
-					}
-					alGenBuffers(1, &bufs[nbufs]);
-					alBufferData(bufs[nbufs], AL_FORMAT_STEREO16, cvt, (ALsizei)(n * 2 * sizeof(int16_t)), 48000);
-					alSourceQueueBuffers(aoSrc, 1, &bufs[nbufs]);
-					{
-						ALenum e = alGetError();
-						if (e != AL_NO_ERROR)
-							vidlog("[audio] queue path err=0x%x at nbufs=%d\n", e, nbufs);
-					}
-					nbufs++;
-					queued++;
-					if (nbufs % 100 == 0)
-						vidlog("[audio] total=%d queued=%d (%.2fs)\n", nbufs, queued, (double)queued * chunk / 48000.0);
-				}
-			}
-			else if (!eof)
-			{
-				if (av_read_frame(fmt, pkt) < 0)
-				{
-					avcodec_send_packet(dec, NULL);
-					eof = 1;
-					vidlog("[audio] decode EOF, total=%d\n", nbufs);
-				}
-				else
-				{
-					if (pkt->stream_index == idx)
-						avcodec_send_packet(dec, pkt);
-					av_packet_unref(pkt);
-				}
-			}
-
-			if (++spike % 500 == 0)
-			{
-				ALint st = 0, q = 0, pr = 0, off = 0;
-				ALfloat sec = 0;
-				alGetSourcei(aoSrc, AL_SOURCE_STATE, &st);
-				alGetSourcei(aoSrc, AL_BUFFERS_QUEUED, &q);
-				alGetSourcei(aoSrc, AL_BUFFERS_PROCESSED, &pr);
-				alGetSourcei(aoSrc, AL_SAMPLE_OFFSET, &off);
-				alGetSourcef(aoSrc, AL_SEC_OFFSET, &sec);
-				aoPosCache = (double)sec;
-				vidlog("[audio] tick state=%d queued=%d processed=%d offset=%d pos=%.3f\n", st, q, pr, off, sec);
-			}
-			{
-				struct timespec ts = {0, 2000000};
-				nanosleep(&ts, NULL);
-			}
-		}
-
-		vidlog("[audio] done: total=%d\n", nbufs);
-		if (bufs)
-		{
-			alSourceStop(aoSrc);
-			alDeleteSources(1, &aoSrc);
-			aoSrc = 0;
-			alDeleteBuffers(nbufs, bufs);
-			free(bufs);
+			if (pkt->stream_index == idx)
+				avcodec_send_packet(dec, pkt);
+			av_packet_unref(pkt);
 		}
 	}
 
-end:
-	vidlog("[audio] cleanup\n");
-	aoStop_primer();
+done:
 	if (cvt)
 		av_free(cvt);
 	if (frm)
@@ -912,121 +750,296 @@ end:
 	if (file)
 		fclose(file);
 	free(path);
-	/*
-		NOTE: do NOT call alcMakeContextCurrent(NULL) or alcDestroyContext here,
-		on the Switch's openal-soft, these calls corrupt the device and kill the game's audio.
-		The context js stays alive and is reused by the next video playback.
-	*/
-	aoAlive = 0;
+	vidlog("[audio] decode thread exiting\n");
 	return NULL;
 }
 
-/**
- * Spawns the audio streaming thread targeting a media file path.
- * Stops any currently running audio instance prior to launch.
- *
- * @param cpath File path string to load audio from.
- */
+// primer (removed on Switch, game keeps device alive)
+static void ao_start_primer(void)
+{
+}
+
+static void ao_stop_primer(void)
+{
+}
+
+/*
+	Main-thread API
+*/
 extern void switchvideo_mpv_audio_start(const char *cpath)
 {
 	vidlog("[audio] switchvideo_mpv_audio_start: %s\n", cpath);
 	switchvideo_mpv_audio_stop_func();
-	aoStop = 0;
-	aoAlive = 1;
-	aoGate = 0;
+
+	aoWantStop = 0;
 	aoReady = 0;
-	aoCtx = alcGetCurrentContext();
-	aoDev = aoCtx ? alcGetContextsDevice(aoCtx) : NULL;
-	vidlog("[audio] saved ctx=%p dev=%p\n", aoCtx, aoDev);
+	aoDone = 0;
+	aoGate = 0;
+	aoRingHead = 0;
+	aoRingTail = 0;
+	aoRingEof = 0;
+	aoPlayStartSec = 0;
+	aoPosCache = 0;
+	for (int i = 0; i < AL_BUF_COUNT; i++)
+		aoBufHasData[i] = 0;
+
+	ao_start_primer();
+
 	char *path = (char *)malloc(strlen(cpath) + 1);
 	strcpy(path, cpath);
+
 	pthread_create(&aoThread, NULL, switchvideo_mpv_ao_func, path);
-	vidlog("[audio] thread created\n");
+	aoThreadCreated = 1;
+	vidlog("[audio] decode thread launched\n");
 }
 
-/**
- * Opens the playback synchronization gate to unblock audio playback.
- */
 extern void switchvideo_mpv_audio_gate_open(void)
 {
 	aoGate = 1;
 }
 
-/**
- * Polls the initialization state of the audio thread.
- *
- * @return 1 if initial audio buffers are primed and ready for playback, or 0 otherwise.
- */
 extern int switchvideo_mpv_ao_is_ready(void)
 {
 	return aoReady;
 }
 
-/**
- * Retrieves the current playback time position in seconds.
- *
- * @return Playback time in seconds.
- */
 extern double switchvideo_mpv_ao_get_pos(void)
 {
 	return aoPosCache;
 }
 
 /*
-	The Switch openal-soft mixer stops consuming buffers if the AL device
-	sits idle (no playing source) for a while; the source then stays
-	AL_PLAYING forever with AL_BUFFERS_PROCESSED stuck at 0. Keep a
-	looping zero-gain silence source alive while we wait for the video
-	gate so the device never goes idle.
+	Called every frame from the main (game) thread.
+	All OpenAL calls happen here. The decode thread never touches OpenAL.
 */
-static void switchvideo_mpv_ao_start_primer(void)
+extern void switchvideo_mpv_ao_update(void)
 {
-	if (aoPrimerBuf != 0 || aoPrimerSrc != 0)
+	if (!aoReady || aoDone)
 		return;
-	short *sil = (short *)malloc(48000 * 2 * (int)sizeof(short));
-	memset(sil, 0, 48000 * 2 * (int)sizeof(short));
-	alGenBuffers(1, &aoPrimerBuf);
-	alBufferData(aoPrimerBuf, AL_FORMAT_STEREO16, sil,
-				 48000 * 2 * (int)sizeof(short), 48000);
-	free(sil);
-	alGenSources(1, &aoPrimerSrc);
-	alSourcei(aoPrimerSrc, AL_LOOPING, AL_TRUE);
-	alSourcei(aoPrimerSrc, AL_BUFFER, aoPrimerBuf);
-	alSourcef(aoPrimerSrc, AL_GAIN, 0.0f);
-	alSourcePlay(aoPrimerSrc);
-	vidlog("[audio] primer source playing\n");
+	ALCcontext *ctx = alcGetCurrentContext();
+	if (!ctx)
+		return;
+
+	// create source and buffers on first call
+	if (aoSrc == 0)
+	{
+		ALCdevice *dev = alcGetContextsDevice(ctx);
+		const char *devName = dev ? alcGetString(dev, ALC_DEVICE_SPECIFIER) : "null";
+		vidlog("[audio] context=%p device=%p name='%s'\n", ctx, dev, devName ? devName : "null");
+
+		ALfloat listenerGain = 0;
+		alGetListenerf(AL_GAIN, &listenerGain);
+		vidlog("[audio] listener gain=%.2f\n", (double)listenerGain);
+
+		alGetError();
+		alGenSources(1, &aoSrc);
+		ALenum e = alGetError();
+		if (aoSrc == 0 || e != AL_NO_ERROR)
+		{
+			vidlog("[audio] alGenSources failed: src=%u err=0x%x\n", aoSrc, e);
+			aoSrc = 0;
+			return;
+		}
+		alGenBuffers(AL_BUF_COUNT, aoBufs);
+		e = alGetError();
+		if (e != AL_NO_ERROR)
+			vidlog("[audio] alGenBuffers failed: err=0x%x\n", e);
+		alSourcef(aoSrc, AL_GAIN, 1.0f);
+
+		ALfloat srcGain = 0;
+		alGetSourcef(aoSrc, AL_GAIN, &srcGain);
+		vidlog("[audio] source gain=%.2f after set\n", (double)srcGain);
+
+		ALfloat pos[3] = {0,0,0};
+		alGetListenerfv(AL_POSITION, pos);
+		vidlog("[audio] listener pos=(%.1f,%.1f,%.1f)\n", (double)pos[0], (double)pos[1], (double)pos[2]);
+
+		alGetSourcefv(aoSrc, AL_POSITION, pos);
+		vidlog("[audio] source pos=(%.1f,%.1f,%.1f)\n", (double)pos[0], (double)pos[1], (double)pos[2]);
+
+		for (int i = 0; i < AL_BUF_COUNT; i++)
+			aoBufHasData[i] = 0;
+		vidlog("[audio] AL source=%u created\n", aoSrc);
+	}
+
+	/*
+		Recycle processed buffers, it can't rely on AL_BUFFERS_PROCESSED on Switch (broken asf),
+		so try to unqueue directly and check error.
+	*/
+	int reclaimed = 0;
+	for (int i = 0; i < AL_BUF_COUNT; i++)
+	{
+		alGetError();
+		ALuint buf = 0;
+		alSourceUnqueueBuffers(aoSrc, 1, &buf);
+		ALenum e = alGetError();
+		if (e != AL_NO_ERROR)
+			break;
+		for (int j = 0; j < AL_BUF_COUNT; j++)
+		{
+			if (aoBufs[j] == buf)
+			{
+				aoBufHasData[j] = 0;
+				reclaimed++;
+				break;
+			}
+		}
+	}
+	if (reclaimed > 2)
+		vidlog("[audio] reclaimed %d buffers\n", reclaimed);
+
+	// fill empty buffers from ring buffer. Count how many are still queued after reclaim.
+	int totalQueued = 0;
+	for (int i = 0; i < AL_BUF_COUNT; i++)
+		if (aoBufHasData[i])
+			totalQueued++;
+
+	for (int i = 0; i < AL_BUF_COUNT; i++)
+	{
+		if (aoBufHasData[i])
+			continue;
+
+		int16_t tmp[AL_BUF_SAMPLES * 2];
+		int bytes = AL_BUF_SAMPLES * 2 * (int)sizeof(int16_t);
+		int got = ring_read((uint8_t *)tmp, bytes);
+		if (got <= 0)
+			break;
+		{
+			int nonZero = 0;
+			for (int k = 0; k < got / 2; k++)
+				if (tmp[k] != 0)
+				{
+					nonZero = 1;
+					break;
+				}
+			if (!nonZero)
+			{
+				static int silentLog = 0;
+				if (silentLog++ < 3)
+					vidlog("[audio] warning: silence buffer got=%d\n", got);
+			}
+		}
+
+		alGetError();
+		alBufferData(aoBufs[i], AL_FORMAT_STEREO16, tmp, got, 48000);
+		ALenum e1 = alGetError();
+		alSourceQueueBuffers(aoSrc, 1, &aoBufs[i]);
+		ALenum e2 = alGetError();
+		if (e1 != AL_NO_ERROR || e2 != AL_NO_ERROR)
+			vidlog("[audio] queue failed buf=%u got=%d e1=0x%x e2=0x%x\n", aoBufs[i], got, e1, e2);
+		else
+		{
+			aoBufHasData[i] = 1;
+			totalQueued++;
+		}
+	}
+
+	// start playback when gate is open and we have at least 1 buffer
+	ALint state = 0;
+	alGetSourcei(aoSrc, AL_SOURCE_STATE, &state);
+	if (aoGate && state != AL_PLAYING && state != AL_PAUSED)
+	{
+		if (totalQueued >= 1)
+		{
+			ao_stop_primer();
+			alGetError();
+			alSourcePlay(aoSrc);
+			ALenum e = alGetError();
+			{
+				struct timespec ts;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+				aoPlayStartSec = ts.tv_sec + ts.tv_nsec / 1e9;
+			}
+			ALint queued = 0;
+			alGetSourcei(aoSrc, AL_BUFFERS_QUEUED, &queued);
+			vidlog("[audio] playback started queued=%d state=%d err=0x%x alQueued=%d\n", totalQueued, state, e, queued);
+			alGetSourcei(aoSrc, AL_SOURCE_STATE, &state);
+			vidlog("[audio] after play state=%d\n", state);
+		}
+	}
+
+	// if stopped mid-playback and more data available, restart
+	if (aoGate && state == AL_STOPPED && !aoRingEof && totalQueued > 0)
+	{
+		alSourcePlay(aoSrc);
+		vidlog("[audio] restart after stall queued=%d\n", totalQueued);
+	}
+
+	// update position, AL_SEC_OFFSET is stuck at ~81ms on Switch, use wall time
+	if (aoPlayStartSec > 0)
+	{
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		aoPosCache = ts.tv_sec + ts.tv_nsec / 1e9 - aoPlayStartSec;
+		ALfloat sec = 0;
+		alGetSourcef(aoSrc, AL_SEC_OFFSET, &sec);
+		static int posLog = 0;
+		if (++posLog % 60 == 0)
+			vidlog("[audio] pos wall=%.2f secOffset=%.3f state=%d queued=%d\n", aoPosCache, (double)sec, state, totalQueued);
+	}
+
+	// check if playback is complete: EOF + ring empty + source stopped
+	if (aoRingEof)
+	{
+		int ringAvail = (aoRingHead - aoRingTail) & RING_MASK;
+		if (ringAvail == 0 && totalQueued == 0 && state == AL_STOPPED && aoPlayStartSec > 0)
+		{
+			vidlog("[audio] playback complete\n");
+			aoDone = 1;
+		}
+	}
 }
 
-/**
- * Stops and destroys the zero-gain silent OpenAL primer source.
- */
-static void aoStop_primer(void)
-{
-	if (aoPrimerSrc != 0)
-	{
-		alSourceStop(aoPrimerSrc);
-		alDeleteSources(1, &aoPrimerSrc);
-		aoPrimerSrc = 0;
-	}
-	if (aoPrimerBuf != 0)
-	{
-		alDeleteBuffers(1, &aoPrimerBuf);
-		aoPrimerBuf = 0;
-	}
-}
-
-/**
- * Signals the audio thread to terminate and waits for join completion.
- * The audio thread creates its own OpenAL context, so the game's
- * context is never touched and no restoration is needed.
- */
 extern void switchvideo_mpv_audio_stop_func(void)
 {
-	aoStop = 1;
-	if (aoAlive)
+	aoWantStop = 1;
+	aoGate = 0;
+
+	vidlog("[audio] stop: joining decode thread\n");
+	if (aoThreadCreated)
+	{
 		pthread_join(aoThread, NULL);
-	aoAlive = 0;
-	aoCtx = NULL;
-	aoDev = NULL;
+		aoThreadCreated = 0;
+	}
+	vidlog("[audio] stop: thread joined, cleaning up AL objects\n");
+
+	if (aoSrc != 0)
+	{
+		alGetError();
+		alSourceStop(aoSrc);
+		alSourcei(aoSrc, AL_BUFFER, 0);
+		alGetError();
+	}
+
+	// Let the mixer process the state changes before we free the objects.
+	struct timespec ts = {0, 100000000};
+	nanosleep(&ts, NULL);
+
+	if (aoSrc != 0)
+	{
+		alDeleteSources(1, &aoSrc);
+		aoSrc = 0;
+	}
+	// ONLY delete buffers if they were actually created (non-zero names)
+	{
+		int haveBufs = 0;
+		for (int i = 0; i < AL_BUF_COUNT; i++)
+			if (aoBufs[i] != 0) { haveBufs = 1; break; }
+		if (haveBufs)
+			alDeleteBuffers(AL_BUF_COUNT, aoBufs);
+		for (int i = 0; i < AL_BUF_COUNT; i++)
+			aoBufs[i] = 0;
+	}
+
+	vidlog("[audio] stop: AL objects deleted\n");
+
+	aoWantStop = 0;
+	aoReady = 0;
+	aoDone = 0;
+	aoRingHead = 0;
+	aoRingTail = 0;
+	aoRingEof = 0;
+	aoPlayStartSec = 0;
+	aoPosCache = 0;
 }
 #endif

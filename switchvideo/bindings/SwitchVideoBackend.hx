@@ -80,6 +80,9 @@ extern class SwitchVideoBackend {
 	@:native("switchvideo_mpv_audio_stop_func")
 	public static function switchvideo_mpv_audio_stop_func():Void;
 
+	@:native("switchvideo_mpv_ao_update")
+	public static function switchvideo_mpv_ao_update():Void;
+
 	// Logging
 
 	@:native("switchvideo_mpv_set_log_callback")
