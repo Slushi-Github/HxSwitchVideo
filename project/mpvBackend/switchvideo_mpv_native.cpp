@@ -463,6 +463,8 @@ static ALuint aoBufsInt[AO_BUFS];
 static ALuint aoPrimerSrc = 0;
 static ALuint aoPrimerBuf = 0;
 static ALCcontext *aoCtx = NULL;
+static ALCcontext *aoAudioCtx = NULL;
+static ALCdevice *aoDev = NULL;
 static volatile int aoGate = 0;
 static volatile int aoReady = 0;
 
@@ -569,22 +571,35 @@ static void *switchvideo_mpv_ao_func(void *arg)
 	FILE *file = NULL;
 	AVIOContext *avio = NULL;
 
-	vidlog("[audio] thread started, path=%s ctx=%p\n", path, aoCtx);
+	vidlog("[audio] thread started, path=%s dev=%p\n", path, aoDev);
 
-	if (aoCtx)
+	/*
+		Reuse or create a persistent audio-only context on the same device.
+		We NEVER destroy this context because alcDestroyContext on Switch's
+		openal-soft appears to reset or corrupt the device, killing the
+		game's audio even though the game's own context is untouched.
+	*/
+	if (!aoAudioCtx && aoDev)
 	{
-		if (!alcMakeContextCurrent(aoCtx))
+		aoAudioCtx = alcCreateContext(aoDev, NULL);
+		if (aoAudioCtx)
+			vidlog("[audio] created persistent audio context=%p\n", aoAudioCtx);
+		else
+			vidlog("[audio] alcCreateContext FAILED: %d\n", alcGetError(aoDev));
+	}
+
+	if (aoAudioCtx)
+	{
+		if (!alcMakeContextCurrent(aoAudioCtx))
 			vidlog("[audio] alcMakeContextCurrent FAILED: 0x%x\n", alcGetError(NULL));
 		else
 		{
-			ALCdevice *dev = alcGetContextsDevice(aoCtx);
-			const ALCchar *name = dev ? alcGetString(dev, ALC_DEVICE_SPECIFIER) : NULL;
-			vidlog("[audio] context current, device=%s\n", name ? name : "?");
+			vidlog("[audio] audio context current, starting primer\n");
 			switchvideo_mpv_ao_start_primer();
 		}
 	}
 	else
-		vidlog("[audio] WARNING: no OpenAL context saved\n");
+		vidlog("[audio] WARNING: no audio context available\n");
 
 	file = fopen(path, "rb");
 	if (!file)
@@ -897,8 +912,12 @@ end:
 	if (file)
 		fclose(file);
 	free(path);
+	/*
+		NOTE: do NOT call alcMakeContextCurrent(NULL) or alcDestroyContext here,
+		on the Switch's openal-soft, these calls corrupt the device and kill the game's audio.
+		The context js stays alive and is reused by the next video playback.
+	*/
 	aoAlive = 0;
-	alcMakeContextCurrent(NULL);
 	return NULL;
 }
 
@@ -917,7 +936,8 @@ extern void switchvideo_mpv_audio_start(const char *cpath)
 	aoGate = 0;
 	aoReady = 0;
 	aoCtx = alcGetCurrentContext();
-	vidlog("[audio] saved ctx=%p\n", aoCtx);
+	aoDev = aoCtx ? alcGetContextsDevice(aoCtx) : NULL;
+	vidlog("[audio] saved ctx=%p dev=%p\n", aoCtx, aoDev);
 	char *path = (char *)malloc(strlen(cpath) + 1);
 	strcpy(path, cpath);
 	pthread_create(&aoThread, NULL, switchvideo_mpv_ao_func, path);
@@ -997,6 +1017,8 @@ static void aoStop_primer(void)
 
 /**
  * Signals the audio thread to terminate and waits for join completion.
+ * The audio thread creates its own OpenAL context, so the game's
+ * context is never touched and no restoration is needed.
  */
 extern void switchvideo_mpv_audio_stop_func(void)
 {
@@ -1005,5 +1027,6 @@ extern void switchvideo_mpv_audio_stop_func(void)
 		pthread_join(aoThread, NULL);
 	aoAlive = 0;
 	aoCtx = NULL;
+	aoDev = NULL;
 }
 #endif
