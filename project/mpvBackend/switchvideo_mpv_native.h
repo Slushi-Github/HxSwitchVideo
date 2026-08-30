@@ -229,6 +229,12 @@ extern "C"
      */
     void switchvideo_mpv_audio_stop_func(void);
 
+    /**
+     * Main-thread audio update: drains the decode ring buffer into OpenAL.
+     * Must be called every frame from the main thread.
+     */
+    void switchvideo_mpv_ao_update(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -405,6 +405,52 @@ class SwitchVideo extends FlxSprite
 	public function dispose():Void
 	{
 		SwitchVideoBackend.switchvideo_mpv_audio_stop_func();
+		SwitchVideoLog.log('dispose: audio stopped');
+		if (mpvPtr != null)
+		{
+			SwitchVideoLog.log('dispose: skipping mpv_terminate_destroy (crashes Switch mixer thread)');
+			mpvPtr = null;
+		}
+		if (renderPtr != null)
+		{
+			SwitchVideoLog.log('dispose: skipping render_context_free (mpv not terminated, would deadlock)');
+			renderPtr = null;
+		}
+		SwitchVideoLog.log('dispose: GL cleanup');
+		if (fbo != 0)
+		{
+			SwitchVideoBackend.switchvideo_mpv_gl_delete_fbo(fbo, texture);
+			fbo = 0;
+			texture = 0;
+		}
+		SwitchVideoBackend.switchvideo_mpv_gl_clear_default();
+		rgbaBytes = null;
+		argbBytes = null;
+		rgbaPtr = null;
+		argbPtr = null;
+		rect = null;
+		/*
+			Do NOT dispose videoBitmapData directly, it is owned by "graphic" (which is, FlxGraphic).
+			Disposing it here then letting super.destroy() destroy "graphic" causes double-free
+			and heap corruption that later aborts at a memory address, that is "Instruction Abort".
+		*/
+		if (graphic != null)
+		{
+			graphic.destroy();
+			graphic = null;
+		}
+		videoBitmapData = null;
+		_isPlaying = false;
+		_isPaused = false;
+		_formatReady = false;
+	}
+
+	/**
+	 * @deprecated kept for reference
+	 */
+	public function dispose_old():Void
+	{
+		SwitchVideoBackend.switchvideo_mpv_audio_stop_func();
 
 		// teardown order matters: the mpv core must be terminated BEFORE the
 		// render context is freed - mpv_render_context_free() blocks until the
@@ -643,6 +689,9 @@ class SwitchVideo extends FlxSprite
 				SwitchVideoLog.log('start: Audio ready, unpaused mpv');
 			}
 		}
+
+		if (_isPlaying && !_isPaused)
+			SwitchVideoBackend.switchvideo_mpv_ao_update();
 
 		if (_isPlaying && !_isPaused && _formatReady && renderPtr != null && videoBitmapData != null)
 		{
