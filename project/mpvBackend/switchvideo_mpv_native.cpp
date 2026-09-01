@@ -703,7 +703,7 @@ static void *switchvideo_mpv_ao_func(void *arg)
 				avcodec_send_packet(dec, NULL);
 				if (avcodec_receive_frame(dec, frm) == 0)
 				{
-					int n = swr_convert(swr, (uint8_t **)&cvt, AO_SAMP, const uint8_t **)frm->extended_data, frm->nb_samples);
+					int n = swr_convert(swr, (uint8_t **)&cvt, AO_SAMP, (const uint8_t **)frm->extended_data, frm->nb_samples);
 					if (n > 0)
 					{
 						int bytes = n * 2 * (int)sizeof(int16_t);
