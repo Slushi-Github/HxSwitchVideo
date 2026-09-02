@@ -166,6 +166,11 @@ class SwitchVideo extends FlxSprite
 	private var _teardownQueued:Bool = false;
 
 	/**
+	 * Guard flag to prevent double-dispose from FlxSpriteGroup member destruction.
+	 */
+	private var _disposed:Bool = false;
+
+	/**
 	 * File path of the currently loaded video file.
 	 */
 	private var _videoPath:String = "";
@@ -234,6 +239,7 @@ class SwitchVideo extends FlxSprite
 		{
 			dispose();
 
+			_disposed = false;
 			_videoPath = path;
 			_shouldLoop = options != null && options.indexOf('input-repeat=65545') != -1;
 			_formatReady = false;
@@ -404,18 +410,41 @@ class SwitchVideo extends FlxSprite
 	 */
 	public function dispose():Void
 	{
-		SwitchVideoBackend.switchvideo_mpv_audio_stop_func();
-		SwitchVideoLog.log('dispose: audio stopped');
+		if (_disposed)
+			return;
+		_disposed = true;
+
 		if (mpvPtr != null)
 		{
-			SwitchVideoLog.log('dispose: skipping mpv_terminate_destroy (crashes Switch mixer thread)');
+			SwitchVideoLog.log('dispose: sending quit command to mpv');
+			Mpv.mpv_command_string(mpvPtr, 'quit');
+
+			var shutdownSeen:Bool = false;
+			var attempts:Int = 0;
+			while (attempts < 20)
+			{
+				var evt:Pointer<CppVoid> = Mpv.mpv_wait_event(mpvPtr, 0.05);
+				if (evt != null && SwitchVideoBackend.switchvideo_mpv_event_id(evt) == Mpv.EVENT_SHUTDOWN)
+				{
+					shutdownSeen = true;
+					break;
+				}
+				attempts++;
+			}
+			SwitchVideoLog.log('dispose: mpv shutdown received=$shutdownSeen after $attempts attempts');
 			mpvPtr = null;
 		}
+
+		SwitchVideoBackend.switchvideo_mpv_audio_stop_func();
+		SwitchVideoLog.log('dispose: audio stopped');
+
 		if (renderPtr != null)
 		{
-			SwitchVideoLog.log('dispose: skipping render_context_free (mpv not terminated, would deadlock)');
+			SwitchVideoLog.log('dispose: freeing render context');
+			SwitchVideoBackend.switchvideo_mpv_render_context_free(renderPtr);
 			renderPtr = null;
 		}
+
 		SwitchVideoLog.log('dispose: GL cleanup');
 		if (fbo != 0)
 		{
@@ -751,6 +780,12 @@ class SwitchVideo extends FlxSprite
 
 	override public function destroy():Void
 	{
+		if (_disposed)
+		{
+			super.destroy();
+			return;
+		}
+
 		if (FlxG.signals.focusGained.has(onFocusGained))
 			FlxG.signals.focusGained.remove(onFocusGained);
 		if (FlxG.signals.focusLost.has(onFocusLost))
