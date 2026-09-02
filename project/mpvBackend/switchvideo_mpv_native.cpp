@@ -793,16 +793,29 @@ extern void switchvideo_mpv_audio_start(const char *cpath)
 	vidlog("[audio] decode thread launched\n");
 }
 
+/**
+ * Opens the playback synchronization gate to unblock audio playback.
+ */
 extern void switchvideo_mpv_audio_gate_open(void)
 {
 	aoGate = 1;
 }
 
+/**
+ * Polls the initialization state of the audio thread.
+ *
+ * @return 1 if initial audio buffers are primed and ready for playback, or 0 otherwise.
+ */
 extern int switchvideo_mpv_ao_is_ready(void)
 {
 	return aoReady;
 }
 
+/**
+ * Retrieves the current playback time position in seconds.
+ *
+ * @return Playback time in seconds.
+ */
 extern double switchvideo_mpv_ao_get_pos(void)
 {
 	return aoPosCache;
